@@ -20,8 +20,7 @@ DEFAULT_MODEL = "gpt-5-mini"  # set any Responses-capable text model
 AI_ENABLED_DEFAULT = True
 AI_MAX_ROWS_DEFAULT = 500
 
-# --- Canonical EU/UK NRV nutrients for vitamins & minerals ---------------
-# (use for "requires NRV?" decisions; presence of these implies NRV is required)
+# --- Canonical EU/UK NRV nutrients for vitamins & minerals --------------------
 VITAMIN_MINERAL_NRV_TERMS = {
     # Vitamins
     "vitamin a",
@@ -117,9 +116,9 @@ NON_FOOD_TOKENS = {
 # Regex for free-text NRV detection (used as a fallback)
 NRV_REGEX = re.compile(r"(\d+(?:\.\d+)?)\s*%?\s*NRV", flags=re.IGNORECASE)
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Utilities
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
 def normalise_text(x: Any) -> str:
@@ -149,9 +148,16 @@ def stringify_maybe_json(val: Any) -> str:
     return normalise_text(val)
 
 
-# -------------------------------------------------------------------------
+def approx_tokens_from_text(text: str) -> int:
+    """Rough heuristic: ~4 chars per token."""
+    if not text:
+        return 0
+    return max(1, int(len(text) / 4))
+
+
+# ------------------------------------------------------------------------------
 # JSON parsing for nutritional_info
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 Number = Union[int, float]
 
@@ -188,10 +194,7 @@ def _is_vitmin_name(n: str) -> bool:
 
 
 def _scan_for_percents(obj: Any) -> List[float]:
-    """
-    Extract any plausible % values from nested objects (dict/list/str/num).
-    Conservative: returns empty if nothing looks like a number.
-    """
+    """Extract plausible % values from nested objects (dict/list/str/num)."""
     found: List[float] = []
 
     def add_if_number(v: Any):
@@ -204,14 +207,12 @@ def _scan_for_percents(obj: Any) -> List[float]:
             lk = str(k).lower()
             if any(h in lk for h in NRV_KEY_HINTS) or "%" in lk:
                 add_if_number(v)
-            # also recursively scan values
             if isinstance(v, (dict, list, str, int, float)):
                 found.extend(_scan_for_percents(v))
     elif isinstance(obj, list):
         for item in obj:
             found.extend(_scan_for_percents(item))
     elif isinstance(obj, (int, float, str)):
-        # look for patterns like "1250% NRV" or "1250%"
         if isinstance(obj, str):
             for m in re.finditer(r"(\d+(?:\.\d+)?)\s*%?", obj):
                 try:
@@ -232,9 +233,7 @@ def _iter_nutrients(obj: Any) -> Iterable[Tuple[str, Any]]:
     """
     if isinstance(obj, dict):
         for k, v in obj.items():
-            # direct nutrient key
             yield str(k), v
-            # nested dicts that have explicit "name"/"nutrient" keys — handle downstream
     elif isinstance(obj, list):
         for item in obj:
             if isinstance(item, dict):
@@ -242,7 +241,6 @@ def _iter_nutrients(obj: Any) -> Iterable[Tuple[str, Any]]:
                 if name:
                     yield str(name), item
                 else:
-                    # No explicit name; still yield a generic bucket to scan percents
                     yield "unknown", item
 
 
@@ -251,18 +249,16 @@ def extract_nrv_from_nutritional_json(
 ) -> Tuple[bool, List[Dict[str, Any]], bool, List[str]]:
     """
     Returns:
-      - has_any_nrv_percent (bool): did we find any numeric % that looks like NRV?
-      - nrv_entries (list of {nutrient, nrv_percent}): one per nutrient where % found
-      - has_vitamin_mineral (bool): did we detect any vitamin/mineral name at all?
-      - vitmin_names (list): names detected
+      - has_any_nrv_percent (bool): found any numeric % that looks like NRV?
+      - nrv_entries (list of {nutrient, nrv_percent})
+      - has_vitamin_mineral (bool): any vitamin/mineral name detected?
+      - vitmin_names (list)
     """
-    # parse if string
     data = nutritional_info
     if isinstance(nutritional_info, str):
         try:
             data = json.loads(nutritional_info)
         except Exception:
-            # string but not JSON; fall back to regex detection
             text = nutritional_info
             raw_perc = [float(m.group(1)) for m in NRV_REGEX.finditer(text)]
             return (
@@ -283,16 +279,12 @@ def extract_nrv_from_nutritional_json(
 
     if isinstance(data, (dict, list)):
         for name, block in _iter_nutrients(data):
-            # Determine if this "name" is a vitamin/mineral
             is_vitmin = _is_vitmin_name(name)
             if is_vitmin and name not in vitmin_names:
                 vitmin_names.append(name)
                 found_vitmin_any = True
 
-            # Try to find % values near this nutrient block
-            percents = []
-
-            # direct dict shape: look for obvious keys first
+            percents: List[float] = []
             if isinstance(block, dict):
                 for k, v in block.items():
                     lk = str(k).lower()
@@ -300,8 +292,6 @@ def extract_nrv_from_nutritional_json(
                         num = _maybe_number(v)
                         if num is not None:
                             percents.append(num)
-
-            # general recursive scan for any percent
             if not percents:
                 percents = _scan_for_percents(block)
 
@@ -311,19 +301,17 @@ def extract_nrv_from_nutritional_json(
 
         return found_percent_any, nrv_entries, found_vitmin_any, vitmin_names
 
-    # Not JSON/dict/list — nothing usable
     return False, [], False, []
 
 
-# -------------------------------------------------------------------------
-# Column mapping (supports general files but prioritises your schema)
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Column mapping (expects your schema, tolerates others)
+# ------------------------------------------------------------------------------
 
 
 def infer_semantic_fields(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     cols_lower = {c.lower(): c for c in df.columns}
 
-    # Priority path: expected three columns
     sku_col = cols_lower.get("sku")
     sku_name_col = (
         cols_lower.get("sku_name")
@@ -343,7 +331,6 @@ def infer_semantic_fields(df: pd.DataFrame) -> Dict[str, Optional[str]]:
             "is_json_nutrition": True,
         }
 
-    # Fallback: best-effort mapping for broader files
     def pick(candidates: List[str]) -> Optional[str]:
         for c in df.columns:
             lc = c.lower()
@@ -362,13 +349,13 @@ def infer_semantic_fields(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         "claims_col": pick(
             ["claim", "benefit", "front of pack", "fop", "pack copy", "description"]
         ),
-        "is_json_nutrition": True,  # assume JSON; detection below will cope with strings
+        "is_json_nutrition": True,
     }
 
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Rules engine + AI assist
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
 def rule_requires_nrv(
@@ -424,7 +411,7 @@ def openai_client(api_key_override: Optional[str] = None) -> Optional["OpenAI"]:
 
 def llm_requires_nrv(
     client: "OpenAI", model: str, record: Dict[str, Any]
-) -> Tuple[Optional[bool], str]:
+) -> Tuple[Optional[bool], str, Optional[int], Optional[int]]:
     prompt = f"""
 You are a UK/EU food supplement labelling compliance assistant.
 Decide if the product MUST display %NRV for vitamins/minerals.
@@ -452,21 +439,65 @@ Record (JSON):
                 text = resp.output[0].content[0].text
             except Exception:
                 text = None
+
+        usage = getattr(resp, "usage", None)
+        in_tok = getattr(usage, "input_tokens", None) if usage else None
+        out_tok = getattr(usage, "output_tokens", None) if usage else None
+
         if not text:
-            return None, ""
+            return None, "", in_tok, out_tok
         data = json.loads(text)
         req = data.get("requires_nrv", None)
         rat = data.get("rationale", "")
         if isinstance(req, bool):
-            return req, rat
-        return None, rat
+            return req, rat, in_tok, out_tok
+        return None, rat, in_tok, out_tok
     except Exception:
-        return None, ""
+        return None, "", None, None
 
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Robust file reading (with helpful errors)
+# ------------------------------------------------------------------------------
+
+
+def _read_table(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+
+    if name.endswith(".xlsx"):
+        try:
+            return pd.read_excel(uploaded_file, engine="openpyxl")
+        except ImportError:
+            raise RuntimeError(
+                "Missing dependency 'openpyxl'. Install it with: pip install openpyxl"
+            )
+
+    if name.endswith(".xls"):
+        try:
+            return pd.read_excel(uploaded_file, engine="xlrd")
+        except ImportError:
+            raise RuntimeError(
+                "Missing dependency 'xlrd' for .xls files. Install: pip install xlrd"
+            )
+
+    if name.endswith(".xlsb"):
+        try:
+            return pd.read_excel(uploaded_file, engine="pyxlsb")
+        except ImportError:
+            raise RuntimeError(
+                "Missing dependency 'pyxlsb' for .xlsb files. Install: pip install pyxlsb"
+            )
+
+    raise RuntimeError(
+        "Unsupported file type. Please upload .csv, .xlsx, .xls, or .xlsb"
+    )
+
+
+# ------------------------------------------------------------------------------
 # Streamlit UI
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
 def main():
@@ -501,22 +532,49 @@ def main():
         )
 
         st.divider()
+        st.markdown("**Pricing (USD per 1K tokens)**")
+        price_in = st.number_input(
+            "Input rate ($/1K tokens)",
+            min_value=0.0,
+            value=0.0,
+            step=0.001,
+            format="%.4f",
+        )
+        price_out = st.number_input(
+            "Output rate ($/1K tokens)",
+            min_value=0.0,
+            value=0.0,
+            step=0.001,
+            format="%.4f",
+        )
+        st.caption(
+            "Enter your contract rates here to enable cost projection & actuals."
+        )
+
+        st.markdown("**Projection assumptions (tokens per AI call)**")
+        assumed_in_toks = st.number_input(
+            "Assumed input tokens per call", min_value=0, value=600, step=50
+        )
+        assumed_out_toks = st.number_input(
+            "Assumed output tokens per call", min_value=0, value=120, step=10
+        )
+
+        st.divider()
         st.markdown(
             "**Expected schema**: `sku`, `sku_name`, `nutritional_info` (JSON). "
             "App also handles broader schemas on a best-effort basis."
         )
 
-    uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
+    uploaded = st.file_uploader(
+        "Upload CSV or Excel", type=["csv", "xlsx", "xls", "xlsb"]
+    )
     if not uploaded:
         st.info("Upload a product file to get started.")
         st.stop()
 
     # Read file
     try:
-        if uploaded.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded)
-        else:
-            df = pd.read_excel(uploaded)
+        df = _read_table(uploaded)
     except Exception as e:
         st.error(f"Failed to read file: {e}")
         st.stop()
@@ -558,10 +616,42 @@ def main():
             )
             use_ai = False
 
+    total_rows = len(df)
+    planned_ai_calls = min(total_rows, int(max_rows_ai)) if use_ai else 0
+
+    # Projected cost for this run
+    projected_input_tokens = planned_ai_calls * assumed_in_toks
+    projected_output_tokens = planned_ai_calls * assumed_out_toks
+    projected_cost = (projected_input_tokens / 1000.0) * price_in + (
+        projected_output_tokens / 1000.0
+    ) * price_out
+
+    st.markdown("#### Cost Projection")
+    st.write(
+        {
+            "Planned AI calls": planned_ai_calls,
+            "Projected input tokens": projected_input_tokens,
+            "Projected output tokens": projected_output_tokens,
+            "Projected cost (USD)": round(projected_cost, 6),
+        }
+    )
+
+    # Progress bar
+    progress = st.progress(0)
+    progress_text = st.empty()
+
     results = []
     ai_calls = 0
 
+    # Actual usage trackers
+    actual_in_tokens = 0
+    actual_out_tokens = 0
+
     for idx, row in df.iterrows():
+        # Update progress UI
+        progress.progress(int(((idx + 1) / total_rows) * 100))
+        progress_text.text(f"Processing row {idx + 1} of {total_rows} ...")
+
         # Core rule decision (name/category/nutrition text)
         rule_req, rule_reason = rule_requires_nrv(
             row,
@@ -577,7 +667,6 @@ def main():
             )
         )
 
-        # If JSON shows vitamins/minerals, that alone implies NRV is required
         requires_by_json = json_has_vitmin
         requires = bool(requires_by_json or rule_req)
 
@@ -587,15 +676,22 @@ def main():
             record = {
                 "sku": row.get(sku_col) if sku_col else None,
                 "product_name": row.get(name_col) if name_col else None,
-                "nutrition_top": json_nrv_entries[:10],  # show first few hits
+                "nutrition_top": json_nrv_entries[:10],
                 "vitmins_detected": json_vitmins[:10],
             }
-            ai_req, ai_rat = llm_requires_nrv(client, model, record)
+            req, rat, in_tok, out_tok = llm_requires_nrv(client, model, record)
+            ai_req, ai_rat = req, rat
             ai_calls += 1
+
+            # Accumulate actual usage if provided by API
+            if isinstance(in_tok, int):
+                actual_in_tokens += in_tok
+            if isinstance(out_tok, int):
+                actual_out_tokens += out_tok
+
             requires = bool(requires or (ai_req is True))
 
-        # Presence check:
-        # If NRV is required, we consider it present only if JSON had at least one vitamin/mineral with a numeric %.
+        # Presence check: True if JSON had at least one vitamin/mineral with a numeric %.
         has_nrv_value = bool(json_has_nrv)
 
         status = "PASS" if (not requires or (requires and has_nrv_value)) else "FAIL"
@@ -627,26 +723,42 @@ def main():
             }
         )
 
+    # Finalize progress
+    progress.progress(100)
+    progress_text.text("Processing complete.")
+
     out = pd.DataFrame(results)
     audited = pd.concat([df, out.drop(columns=["_row"])], axis=1)
 
     st.subheader("Audit Output")
     st.dataframe(audited.head(50), use_container_width=True)
 
+    # Actual cost computation (only if usage available & pricing entered)
+    actual_cost = None
+    if (actual_in_tokens or actual_out_tokens) and (price_in > 0 or price_out > 0):
+        actual_cost = (actual_in_tokens / 1000.0) * price_in + (
+            actual_out_tokens / 1000.0
+        ) * price_out
+
     st.markdown("#### Summary KPIs")
     total = len(audited)
     must = int(audited["requires_nrv_final"].sum())
     present = int(audited["has_nrv_value"].sum())
     fail = int((audited["requires_nrv_final"] & ~audited["has_nrv_value"]).sum())
-    st.write(
-        {
-            "Rows audited": total,
-            "Require %NRV": must,
-            "NRV present (any vitamin/mineral)": present,
-            "Open findings (fail)": fail,
-            "AI calls used": ai_calls,
-        }
-    )
+
+    kpis = {
+        "Rows audited": total,
+        "Require %NRV": must,
+        "NRV present (any vitamin/mineral)": present,
+        "Open findings (fail)": fail,
+        "AI calls used": ai_calls,
+        "Projected cost (USD)": round(projected_cost, 6),
+        "Actual input tokens": actual_in_tokens,
+        "Actual output tokens": actual_out_tokens,
+    }
+    if actual_cost is not None:
+        kpis["Actual cost (USD)"] = round(actual_cost, 6)
+    st.write(kpis)
 
     # Export
     buf = io.BytesIO()
@@ -660,7 +772,8 @@ def main():
     )
 
     st.info(
-        "Security: The API key you paste is kept only in Streamlit session_state for this session and is not persisted by the app."
+        "Security: The API key you paste is kept only in Streamlit session_state for this session and is not persisted by the app. "
+        "Set token pricing in the sidebar to enable cost projection & actuals."
     )
 
 
