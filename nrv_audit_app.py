@@ -21,6 +21,7 @@ AI_ENABLED_DEFAULT = True
 AI_MAX_ROWS_DEFAULT = 500
 
 # --- Canonical EU/UK NRV nutrients for vitamins & minerals --------------------
+# (Presence of these implies product should carry %NRV)
 VITAMIN_MINERAL_NRV_TERMS = {
     # Vitamins
     "vitamin a",
@@ -113,8 +114,10 @@ NON_FOOD_TOKENS = {
     "soap",
 }
 
-# Regex for free-text NRV detection (used as a fallback)
+# Regex for free-text NRV detection (fallback)
 NRV_REGEX = re.compile(r"(\d+(?:\.\d+)?)\s*%?\s*NRV", flags=re.IGNORECASE)
+
+Number = Union[int, float]
 
 # ------------------------------------------------------------------------------
 # Utilities
@@ -148,18 +151,9 @@ def stringify_maybe_json(val: Any) -> str:
     return normalise_text(val)
 
 
-def approx_tokens_from_text(text: str) -> int:
-    """Rough heuristic: ~4 chars per token."""
-    if not text:
-        return 0
-    return max(1, int(len(text) / 4))
-
-
 # ------------------------------------------------------------------------------
 # JSON parsing for nutritional_info
 # ------------------------------------------------------------------------------
-
-Number = Union[int, float]
 
 
 def _maybe_number(x: Any) -> Optional[Number]:
@@ -259,6 +253,7 @@ def extract_nrv_from_nutritional_json(
         try:
             data = json.loads(nutritional_info)
         except Exception:
+            # Not JSON; fall back to regex detection
             text = nutritional_info
             raw_perc = [float(m.group(1)) for m in NRV_REGEX.finditer(text)]
             return (
@@ -331,6 +326,7 @@ def infer_semantic_fields(df: pd.DataFrame) -> Dict[str, Optional[str]]:
             "is_json_nutrition": True,
         }
 
+    # Fallback for broader schemas
     def pick(candidates: List[str]) -> Optional[str]:
         for c in df.columns:
             lc = c.lower()
@@ -433,6 +429,8 @@ Record (JSON):
 """
     try:
         resp = client.responses.create(model=model, input=prompt, temperature=0)
+
+        # Extract text robustly
         text = getattr(resp, "output_text", None)
         if not text:
             try:
@@ -440,12 +438,20 @@ Record (JSON):
             except Exception:
                 text = None
 
+        # Extract usage robustly (SDK may return attrs or dict)
+        in_tok = out_tok = None
         usage = getattr(resp, "usage", None)
-        in_tok = getattr(usage, "input_tokens", None) if usage else None
-        out_tok = getattr(usage, "output_tokens", None) if usage else None
+        if usage is not None:
+            if isinstance(usage, dict):
+                in_tok = usage.get("input_tokens")
+                out_tok = usage.get("output_tokens")
+            else:
+                in_tok = getattr(usage, "input_tokens", None)
+                out_tok = getattr(usage, "output_tokens", None)
 
         if not text:
             return None, "", in_tok, out_tok
+
         data = json.loads(text)
         req = data.get("requires_nrv", None)
         rat = data.get("rationale", "")
@@ -568,11 +574,12 @@ def main():
     uploaded = st.file_uploader(
         "Upload CSV or Excel", type=["csv", "xlsx", "xls", "xlsb"]
     )
+
     if not uploaded:
-        st.info("Upload a product file to get started.")
+        st.info("Upload a product file to preview and enable the Run button.")
         st.stop()
 
-    # Read file
+    # Read file (safe; no processing starts yet)
     try:
         df = _read_table(uploaded)
     except Exception as e:
@@ -605,28 +612,28 @@ def main():
         }
     )
 
-    # OpenAI client
+    # Client preload (no calls yet)
     client = None
     if use_ai:
         api_key_override = st.session_state.get("OPENAI_API_KEY_UI")
         client = openai_client(api_key_override)
         if client is None:
             st.warning(
-                "OpenAI key not configured or SDK unavailable. Falling back to rule-only checks."
+                "OpenAI key not configured or SDK unavailable. The audit will run rule-only."
             )
             use_ai = False
 
     total_rows = len(df)
     planned_ai_calls = min(total_rows, int(max_rows_ai)) if use_ai else 0
 
-    # Projected cost for this run
+    # Projected cost for this run (pre-run)
     projected_input_tokens = planned_ai_calls * assumed_in_toks
     projected_output_tokens = planned_ai_calls * assumed_out_toks
     projected_cost = (projected_input_tokens / 1000.0) * price_in + (
         projected_output_tokens / 1000.0
     ) * price_out
 
-    st.markdown("#### Cost Projection")
+    st.markdown("#### Cost Projection (pre-run)")
     st.write(
         {
             "Planned AI calls": planned_ai_calls,
@@ -636,6 +643,14 @@ def main():
         }
     )
 
+    # --- Manual trigger to start the audit ---
+    run_clicked = st.button("▶️ Run NRV Audit", type="primary")
+
+    if not run_clicked:
+        st.stop()
+
+    # ---------------------- RUN AUDIT (on click) ----------------------
+
     # Progress bar
     progress = st.progress(0)
     progress_text = st.empty()
@@ -643,12 +658,12 @@ def main():
     results = []
     ai_calls = 0
 
-    # Actual usage trackers
+    # Actual usage trackers (if API returns usage)
     actual_in_tokens = 0
     actual_out_tokens = 0
 
     for idx, row in df.iterrows():
-        # Update progress UI
+        # Update progress UI (0..100)
         progress.progress(int(((idx + 1) / total_rows) * 100))
         progress_text.text(f"Processing row {idx + 1} of {total_rows} ...")
 
@@ -728,7 +743,14 @@ def main():
     progress_text.text("Processing complete.")
 
     out = pd.DataFrame(results)
-    audited = pd.concat([df, out.drop(columns=["_row"])], axis=1)
+
+    # ---- Avoid duplicate column names when joining with original df ----
+    out_for_join = out.drop(columns=["_row", "sku", "sku_name"], errors="ignore")
+    audited = pd.concat([df, out_for_join], axis=1)
+
+    # Belt-and-braces: drop any remaining duplicate columns (keep first)
+    if audited.columns.duplicated().any():
+        audited = audited.loc[:, ~audited.columns.duplicated()]
 
     st.subheader("Audit Output")
     st.dataframe(audited.head(50), use_container_width=True)
@@ -773,7 +795,8 @@ def main():
 
     st.info(
         "Security: The API key you paste is kept only in Streamlit session_state for this session and is not persisted by the app. "
-        "Set token pricing in the sidebar to enable cost projection & actuals."
+        "Set token pricing in the sidebar to enable cost projection & actuals. "
+        "For .xlsx uploads, ensure 'openpyxl' is installed."
     )
 
 
