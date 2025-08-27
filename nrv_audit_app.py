@@ -86,6 +86,7 @@ VITAMIN_MINERAL_NRV_TERMS = {
     "i",
 }
 
+# Non-food heuristics; if name looks like non-food, NRV isn't required
 NON_FOOD_TOKENS = {
     "beauty",
     "skin",
@@ -112,6 +113,7 @@ NON_FOOD_TOKENS = {
     "soap",
 }
 
+# Regex for free-text NRV detection (fallback)
 NRV_REGEX = re.compile(r"(\d+(?:\.\d+)?)\s*%?\s*NRV", flags=re.IGNORECASE)
 
 Number = Union[int, float]
@@ -155,41 +157,69 @@ def approx_tokens_from_text(text: str) -> int:
     return max(1, int(len(text) / 4))
 
 
-# ------------------------------------------------------------------------------
-# Pricing (auto) — pulled from OpenAI pricing page as of 2025-08-27
-# Values are USD per 1M tokens; converted to per-token / per-1K in code.
-# Source: https://openai.com/api/pricing  (see citation in chat above)
-# ------------------------------------------------------------------------------
-
-# Map by prefix -> (input_per_million, output_per_million)
-_OPENAI_MODEL_PRICING_PER_M: Dict[str, Tuple[float, float]] = {
-    # GPT-5 family
-    "gpt-5-nano": (0.05, 0.40),
-    "gpt-5-mini": (0.25, 2.00),
-    "gpt-5": (1.25, 10.00),
-    # GPT-4o family
-    "gpt-4o-mini": (0.60, 2.40),
-    "gpt-4o": (5.00, 20.00),
-    # Add more if you plan to use them regularly (leave unknowns to fallback)
-}
-
-
-def get_rates_for_model(model_name: str) -> Optional[Tuple[float, float]]:
+def make_json_safe(obj: Any) -> Any:
     """
-    Returns (input_rate_per_token, output_rate_per_token) in USD/token.
-    Matches by prefix (e.g., 'gpt-4o-2024-05-13' matches 'gpt-4o').
+    Convert pandas/NumPy/complex objects into JSON-serializable primitives.
+    - Keep: None, bool, int, float, str
+    - Lists/Tuples/Sets -> list of safe items
+    - Dict -> dict with str/safe keys and safe values
+    - Objects with .item() (NumPy scalars) -> item()
+    - pandas Timestamps/Timedeltas -> ISO/str
+    - Fallback -> str(obj)
     """
-    m = (model_name or "").lower().strip()
-    for prefix, (in_per_m, out_per_m) in _OPENAI_MODEL_PRICING_PER_M.items():
-        if m.startswith(prefix):
-            # Convert from per 1M tokens to per-token USD
-            return in_per_m / 1_000_000.0, out_per_m / 1_000_000.0
-    return None
+    # Primitives
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+
+    # pandas timestamp-like
+    if hasattr(obj, "isoformat"):
+        try:
+            return obj.isoformat()
+        except Exception:
+            pass
+
+    # NumPy scalar
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+
+    # Mapping
+    if isinstance(obj, dict):
+        safe = {}
+        for k, v in obj.items():
+            # ensure key is simple
+            try:
+                key = k if isinstance(k, (str, int, float, bool)) else str(k)
+            except Exception:
+                key = str(k)
+            safe[key] = make_json_safe(v)
+        return safe
+
+    # Iterables
+    if isinstance(obj, (list, tuple, set)):
+        return [make_json_safe(v) for v in obj]
+
+    # Fallback
+    return str(obj)
 
 
 # ------------------------------------------------------------------------------
 # JSON parsing for nutritional_info
 # ------------------------------------------------------------------------------
+
+NRV_KEY_HINTS = {
+    "nrv",
+    "nrv%",
+    "%nrv",
+    "nrv_percent",
+    "percent_nrv",
+    "daily",
+    "ri",
+    "reference intake",
+    "rda",
+}
 
 
 def _maybe_number(x: Any) -> Optional[Number]:
@@ -203,19 +233,6 @@ def _maybe_number(x: Any) -> Optional[Number]:
             except Exception:
                 return None
     return None
-
-
-NRV_KEY_HINTS = {
-    "nrv",
-    "nrv%",
-    "%nrv",
-    "nrv_percent",
-    "percent_nrv",
-    "daily",
-    "ri",
-    "reference intake",
-    "rda",
-}
 
 
 def _is_vitmin_name(n: str) -> bool:
@@ -418,8 +435,9 @@ def openai_client(api_key_override: Optional[str] = None) -> Optional["OpenAI"]:
         return None
 
 
-# Prompt builder reused for projection & runtime
+# Prompt builder reused for projection & runtime — now JSON-safe
 def _build_prompt(record: Dict[str, Any]) -> str:
+    safe_record = make_json_safe(record)
     return f"""
 You are a UK/EU food supplement labelling compliance assistant.
 Decide if the product MUST display %NRV for vitamins/minerals.
@@ -437,7 +455,7 @@ Rules of thumb:
   • If information is insufficient, be conservative and set requires_nrv = false.
 
 Record (JSON):
-{json.dumps(record, ensure_ascii=False)}
+{json.dumps(safe_record, ensure_ascii=False)}
 """.strip()
 
 
@@ -477,6 +495,35 @@ def llm_requires_nrv(
         return None, rat, in_tok, out_tok
     except Exception:
         return None, "", None, None
+
+
+# ------------------------------------------------------------------------------
+# Pricing (auto) — USD per 1M tokens; converted to per-token in code
+# Update values if OpenAI pricing changes.
+# ------------------------------------------------------------------------------
+
+_OPENAI_MODEL_PRICING_PER_M: Dict[str, Tuple[float, float]] = {
+    # GPT-5 family
+    "gpt-5-nano": (0.05, 0.40),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5": (1.25, 10.00),
+    # GPT-4o family
+    "gpt-4o-mini": (0.60, 2.40),
+    "gpt-4o": (5.00, 20.00),
+    # Add more as needed
+}
+
+
+def get_rates_for_model(model_name: str) -> Optional[Tuple[float, float]]:
+    """
+    Returns (input_rate_per_token, output_rate_per_token) in USD/token.
+    Matches by prefix (e.g., 'gpt-4o-2024-05-13' -> 'gpt-4o').
+    """
+    m = (model_name or "").lower().strip()
+    for prefix, (in_per_m, out_per_m) in _OPENAI_MODEL_PRICING_PER_M.items():
+        if m.startswith(prefix):
+            return in_per_m / 1_000_000.0, out_per_m / 1_000_000.0
+    return None
 
 
 # ------------------------------------------------------------------------------
@@ -550,7 +597,7 @@ def main():
         )
 
         st.divider()
-        st.markdown("**Projected cost uses official model rates (no manual input).**")
+        st.markdown("**Projected cost uses built-in rates for the selected model.**")
 
         st.divider()
         st.markdown(
@@ -603,11 +650,8 @@ def main():
     # === PROJECTION (toggle only; independent of API key availability) ===
     planned_ai_calls = min(total_rows, int(max_rows_ai)) if use_ai_toggle else 0
 
-    # Estimate tokens per call from real prompt+row sample (first N rows = planned_ai_calls)
-    # We'll compute input tokens per row as tokens(prompt(record)).
-    # Output tokens: conservative static estimate (60 tokens).
+    # Estimate tokens per call from real prompt+row sample (first N rows)
     est_output_tokens_per_call = 60
-
     est_input_tokens_total = 0
     sample_rows = min(planned_ai_calls, total_rows)
     for i in range(sample_rows):
@@ -623,14 +667,12 @@ def main():
         prompt = _build_prompt(record)
         est_input_tokens_total += approx_tokens_from_text(prompt)
 
-    # If planned calls exceed sampled rows (shouldn't unless toggled), scale
     if sample_rows and planned_ai_calls > sample_rows:
         scale = planned_ai_calls / sample_rows
         est_input_tokens_total = int(est_input_tokens_total * scale)
 
     est_output_tokens_total = planned_ai_calls * est_output_tokens_per_call
 
-    # Pull pricing for selected model
     rates = get_rates_for_model(model)
     if rates:
         in_rate_per_tok, out_rate_per_tok = rates
@@ -658,6 +700,7 @@ def main():
         }
     )
 
+    # --- Manual trigger to start the audit ---
     run_clicked = st.button("▶️ Run NRV Audit", type="primary")
     if not run_clicked:
         st.stop()
@@ -813,8 +856,8 @@ def main():
     )
 
     st.info(
-        "Auto-pricing uses OpenAI public rates (per 1M tokens) for the selected model; "
-        "projection estimates input tokens from the real prompt+records and assumes ~60 output tokens/call. "
+        "Auto-pricing uses built-in rates for the selected model; "
+        "projection estimates input tokens from the real prompt+records (~4 chars/token) and assumes ~60 output tokens/call. "
         "Actual cost uses API usage if available. For .xlsx uploads, ensure 'openpyxl' is installed."
     )
 
