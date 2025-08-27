@@ -25,13 +25,13 @@ VITAMIN_MINERAL_NRV_TERMS = {
     # Vitamins
     "vitamin a",
     "retinol",
-    "beta-carotene",
+    "beta carotene",
     "vitamin d",
     "cholecalciferol",
     "ergocalciferol",
     "vitamin e",
     "tocopherol",
-    "alpha-tocopherol",
+    "alpha tocopherol",
     "vitamin k",
     "phylloquinone",
     "menaquinone",
@@ -129,15 +129,33 @@ def normalise_text(x: Any) -> str:
     return str(x).strip().lower()
 
 
+def normalize_label(s: Any) -> str:
+    if s is None:
+        return ""
+    t = str(s).lower()
+    t = t.replace("_", " ").replace("-", " ")
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def strip_nrv_suffixes(s: str) -> str:
+    """
+    Remove common NRV/RI/RDA suffix noise from keys like 'vitamin_c_nrv', 'vitamin c nrv percent'.
+    """
+    t = normalize_label(s)
+    t = re.sub(r"\b(nrv|ri|rda)( percent| %| pct)?\b.*$", "", t).strip()
+    return t
+
+
 def looks_non_food(name_or_category: str) -> bool:
-    blob = (name_or_category or "").lower()
+    blob = normalize_label(name_or_category or "")
     return any(tok in blob for tok in NON_FOOD_TOKENS)
 
 
 def mentions_vitmin(text: str) -> bool:
     if not text:
         return False
-    t = text.lower()
+    t = normalize_label(text)
     return any(term in t for term in VITAMIN_MINERAL_NRV_TERMS)
 
 
@@ -195,7 +213,9 @@ NRV_KEY_HINTS = {
     "nrv",
     "nrv%",
     "%nrv",
+    "nrv percent",
     "nrv_percent",
+    "percent nrv",
     "percent_nrv",
     "daily",
     "ri",
@@ -218,8 +238,7 @@ def _maybe_number(x: Any) -> Optional[Number]:
 
 
 def _is_vitmin_name(n: str) -> bool:
-    n = n.lower().strip().replace("-", " ")
-    return mentions_vitmin(n)
+    return mentions_vitmin(strip_nrv_suffixes(n))
 
 
 def _scan_for_percents(obj: Any) -> List[float]:
@@ -233,7 +252,7 @@ def _scan_for_percents(obj: Any) -> List[float]:
 
     if isinstance(obj, dict):
         for k, v in obj.items():
-            lk = str(k).lower()
+            lk = normalize_label(k)
             if any(h in lk for h in NRV_KEY_HINTS) or "%" in lk:
                 add_if_number(v)
             if isinstance(v, (dict, list, str, int, float)):
@@ -254,22 +273,54 @@ def _scan_for_percents(obj: Any) -> List[float]:
 
 
 def _iter_nutrients(obj: Any) -> Iterable[Tuple[str, Any]]:
+    """
+    Yield (nutrient_name, value_block) from varied shapes:
+      - { "Vitamin C": {...}, "Magnesium": {...} }
+      - [{ "name": "Vitamin C", ...}, {"nutrient":"Magnesium", ...}]
+      - [{ "vitamin_c": {...} }, {"magnesium": {...}}]   # single-key dict items
+      - { "vitamin_c_nrv": 1250, "magnesium": {...} }    # suffix noise
+    """
     if isinstance(obj, dict):
         for k, v in obj.items():
-            yield str(k), v
+            base = strip_nrv_suffixes(k)
+            yield (base or k), v
     elif isinstance(obj, list):
         for item in obj:
             if isinstance(item, dict):
                 name = item.get("name") or item.get("nutrient") or item.get("component")
-                if name:
-                    yield str(name), item
-                else:
+                if not name:
+                    # single-key dict? use that key as the name
+                    if len(item) == 1:
+                        k = next(iter(item))
+                        base = strip_nrv_suffixes(k)
+                        yield (base or k), item[k]
+                        continue
+                    # otherwise, try to find a key that looks like a vitamin/mineral
+                    found_key = None
+                    for k in item.keys():
+                        if _is_vitmin_name(k):
+                            found_key = k
+                            break
+                    if found_key:
+                        base = strip_nrv_suffixes(found_key)
+                        yield (base or found_key), item[found_key]
+                        continue
+                    # last resort
                     yield "unknown", item
+                else:
+                    yield str(name), item
 
 
 def extract_nrv_from_nutritional_json(
     nutritional_info: Any,
 ) -> Tuple[bool, List[Dict[str, Any]], bool, List[str]]:
+    """
+    Returns:
+      - has_any_nrv_percent (bool): found any numeric % that looks like NRV?
+      - nrv_entries (list of {nutrient, nrv_percent})
+      - has_vitamin_mineral (bool): any vitamin/mineral name detected?
+      - vitmin_names (list)
+    """
     data = nutritional_info
     if isinstance(nutritional_info, str):
         try:
@@ -303,7 +354,7 @@ def extract_nrv_from_nutritional_json(
             percents: List[float] = []
             if isinstance(block, dict):
                 for k, v in block.items():
-                    lk = str(k).lower()
+                    lk = normalize_label(k)
                     if any(h in lk for h in NRV_KEY_HINTS) or "%" in lk:
                         num = _maybe_number(v)
                         if num is not None:
@@ -311,17 +362,38 @@ def extract_nrv_from_nutritional_json(
             if not percents:
                 percents = _scan_for_percents(block)
 
+            # If the "name" wasn't recognised but keys inside the block are vitamin-like,
+            # treat it as a vitamin for %NRV presence purposes.
+            vitaminish_inside = False
+            if not is_vitmin and isinstance(block, dict):
+                for k in block.keys():
+                    if _is_vitmin_name(k):
+                        vitaminish_inside = True
+                        vn = strip_nrv_suffixes(k)
+                        if vn and vn not in vitmin_names:
+                            vitmin_names.append(vn)
+                            found_vitmin_any = True
+                is_vitmin = is_vitmin or vitaminish_inside
+
             if percents and is_vitmin:
                 found_percent_any = True
-                nrv_entries.append({"nutrient": name, "nrv_percent": max(percents)})
-
+                nrv_entries.append(
+                    {
+                        "nutrient": (
+                            name
+                            if name != "unknown"
+                            else (vitmin_names[-1] if vitmin_names else "unknown")
+                        ),
+                        "nrv_percent": max(percents),
+                    }
+                )
         return found_percent_any, nrv_entries, found_vitmin_any, vitmin_names
 
     return False, [], False, []
 
 
 # ------------------------------------------------------------------------------
-# Column mapping
+# Column mapping (expects your schema, tolerates others)
 # ------------------------------------------------------------------------------
 
 
@@ -379,6 +451,13 @@ def rule_requires_nrv(
     category_col: Optional[str],
     nutrition_col: Optional[str],
 ) -> Tuple[bool, str]:
+    """
+    Core rules — conservative and auditable:
+      - Non-food-looking names => False
+      - If product name implies vitamins/minerals => True
+      - If nutrition JSON/text mentions vitamins/minerals => True
+      - Else False (AI can upgrade to True in edge cases)
+    """
     name = normalise_text(row.get(name_col, "")) if name_col else ""
     cat = normalise_text(row.get(category_col, "")) if category_col else ""
     nut_raw = row.get(nutrition_col, None) if nutrition_col else None
@@ -408,7 +487,6 @@ def openai_client(api_key_override: Optional[str] = None) -> Optional["OpenAI"]:
         or os.getenv("OPENAI_API_KEY")
         or st.secrets.get("OPENAI_API_KEY", None)
     )
-    # do not persist beyond process env
     if not api_key:
         return None
     os.environ["OPENAI_API_KEY"] = api_key
@@ -737,8 +815,10 @@ def main():
         requires_by_json = json_has_vitmin
         requires = bool(requires_by_json or rule_req)
 
+        # AI assist (optional)
         ai_req, ai_rat = (None, "")
-        if use_ai_runtime and ai_calls < int(max_rows_ai):
+        ai_reason = None
+        if use_ai_runtime and ai_calls < int(max_rows_ai) and client is not None:
             record = {
                 "sku": row.get(sku_col) if sku_col else None,
                 "product_name": row.get(name_col) if name_col else None,
@@ -752,7 +832,17 @@ def main():
                 actual_in_tokens += in_tok
             if isinstance(out_tok, int):
                 actual_out_tokens += out_tok
-            requires = bool(requires or (ai_req is True))
+            if ai_req is True:
+                requires = True
+            if ai_req is None:
+                ai_reason = "no_response_or_parse_error"
+        else:
+            if not use_ai_runtime:
+                ai_reason = "disabled"
+            elif client is None:
+                ai_reason = "no_api_key_or_sdk"
+            elif ai_calls >= int(max_rows_ai):
+                ai_reason = "capped_by_max_rows"
 
         # Update KPIs (internal)
         if requires:
@@ -770,8 +860,12 @@ def main():
                 "has_nrv_percent": json_has_nrv,
             },
         }
-        if use_ai_runtime:
-            debug_payload["ai"] = {"requires": ai_req, "rationale": ai_rat}
+        if use_ai_toggle:  # show AI section whenever the toggle is on
+            debug_payload["ai"] = {
+                "requires": ai_req,
+                "rationale": ai_rat,
+                "reason": ai_reason,
+            }
 
         debug_checks = json.dumps(make_json_safe(debug_payload), ensure_ascii=False)
 
@@ -842,7 +936,8 @@ def main():
     st.info(
         "The table adds only 'needs_nrv' and 'debug_checks'. "
         "Auto-pricing uses built-in rates; projection estimates input tokens (~4 chars/token) "
-        "and assumes ~60 output tokens/call. Actual cost uses API usage if available."
+        "and assumes ~60 output tokens/call. Actual cost uses API usage if available. "
+        "For .xlsx uploads, ensure 'openpyxl' is installed."
     )
 
 
