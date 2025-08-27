@@ -160,48 +160,30 @@ def approx_tokens_from_text(text: str) -> int:
 def make_json_safe(obj: Any) -> Any:
     """
     Convert pandas/NumPy/complex objects into JSON-serializable primitives.
-    - Keep: None, bool, int, float, str
-    - Lists/Tuples/Sets -> list of safe items
-    - Dict -> dict with str/safe keys and safe values
-    - Objects with .item() (NumPy scalars) -> item()
-    - pandas Timestamps/Timedeltas -> ISO/str
-    - Fallback -> str(obj)
     """
-    # Primitives
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
-
-    # pandas timestamp-like
     if hasattr(obj, "isoformat"):
         try:
             return obj.isoformat()
         except Exception:
             pass
-
-    # NumPy scalar
     if hasattr(obj, "item"):
         try:
             return obj.item()
         except Exception:
             pass
-
-    # Mapping
     if isinstance(obj, dict):
         safe = {}
         for k, v in obj.items():
-            # ensure key is simple
             try:
                 key = k if isinstance(k, (str, int, float, bool)) else str(k)
             except Exception:
                 key = str(k)
             safe[key] = make_json_safe(v)
         return safe
-
-    # Iterables
     if isinstance(obj, (list, tuple, set)):
         return [make_json_safe(v) for v in obj]
-
-    # Fallback
     return str(obj)
 
 
@@ -426,6 +408,7 @@ def openai_client(api_key_override: Optional[str] = None) -> Optional["OpenAI"]:
         or os.getenv("OPENAI_API_KEY")
         or st.secrets.get("OPENAI_API_KEY", None)
     )
+    # do not persist beyond process env
     if not api_key:
         return None
     os.environ["OPENAI_API_KEY"] = api_key
@@ -435,7 +418,7 @@ def openai_client(api_key_override: Optional[str] = None) -> Optional["OpenAI"]:
         return None
 
 
-# Prompt builder reused for projection & runtime — now JSON-safe
+# Prompt builder reused for projection & runtime — JSON-safe
 def _build_prompt(record: Dict[str, Any]) -> str:
     safe_record = make_json_safe(record)
     return f"""
@@ -659,7 +642,6 @@ def main():
         record = {
             "sku": r.get(sku_col) if sku_col else None,
             "product_name": r.get(name_col) if name_col else None,
-            # keep record light to prevent overstated estimate
             "nutrition_excerpt": (
                 str(r.get(nutrition_col))[:800] if nutrition_col else None
             ),
@@ -723,7 +705,12 @@ def main():
     progress = st.progress(0)
     progress_text = st.empty()
 
-    results = []
+    # KPI counters (internal only)
+    kpi_must = 0
+    kpi_present = 0
+    kpi_fail = 0
+
+    results: List[Dict[str, Any]] = []
     ai_calls = 0
     actual_in_tokens = 0
     actual_out_tokens = 0
@@ -732,6 +719,7 @@ def main():
         progress.progress(int(((idx + 1) / total_rows) * 100))
         progress_text.text(f"Processing row {idx + 1} of {total_rows} ...")
 
+        # Rule decision
         rule_req, rule_reason = rule_requires_nrv(
             row,
             name_col=name_col,
@@ -739,6 +727,7 @@ def main():
             nutrition_col=nutrition_col,
         )
 
+        # JSON extraction
         json_has_nrv, json_nrv_entries, json_has_vitmin, json_vitmins = (
             extract_nrv_from_nutritional_json(
                 row.get(nutrition_col) if nutrition_col else None
@@ -759,47 +748,48 @@ def main():
             req, rat, in_tok, out_tok = llm_requires_nrv(client, model, record)
             ai_req, ai_rat = req, rat
             ai_calls += 1
-
             if isinstance(in_tok, int):
                 actual_in_tokens += in_tok
             if isinstance(out_tok, int):
                 actual_out_tokens += out_tok
-
             requires = bool(requires or (ai_req is True))
 
-        has_nrv_value = bool(json_has_nrv)
-        status = "PASS" if (not requires or (requires and has_nrv_value)) else "FAIL"
+        # Update KPIs (internal)
+        if requires:
+            kpi_must += 1
+            if not json_has_nrv:
+                kpi_fail += 1
+        if json_has_nrv:
+            kpi_present += 1
 
+        # Build debug summary (single column)
+        debug_payload: Dict[str, Any] = {
+            "rule": {"requires": rule_req, "reason": rule_reason},
+            "json": {
+                "vitamins_detected": json_vitmins,
+                "has_nrv_percent": json_has_nrv,
+            },
+        }
+        if use_ai_runtime:
+            debug_payload["ai"] = {"requires": ai_req, "rationale": ai_rat}
+
+        debug_checks = json.dumps(make_json_safe(debug_payload), ensure_ascii=False)
+
+        # Store ONLY the requested columns for the table
         results.append(
             {
                 "_row": idx,
                 "sku": row.get(sku_col) if sku_col else None,
                 "sku_name": row.get(name_col) if name_col else None,
-                "requires_nrv_rule": rule_req,
-                "rule_rationale": rule_reason,
-                "requires_nrv_json": requires_by_json,
-                "vitmins_detected_json": (
-                    ", ".join(json_vitmins) if json_vitmins else ""
-                ),
-                "nrv_entries_json": (
-                    "; ".join(
-                        f"{e['nutrient']}: {e['nrv_percent']}%"
-                        for e in json_nrv_entries
-                    )
-                    if json_nrv_entries
-                    else ""
-                ),
-                "requires_nrv_ai": ai_req,
-                "ai_rationale": ai_rat,
-                "requires_nrv_final": requires,
-                "has_nrv_value": has_nrv_value,
-                "status": status,
+                "needs_nrv": requires,
+                "debug_checks": debug_checks,
             }
         )
 
     progress.progress(100)
     progress_text.text("Processing complete.")
 
+    # Build audited table: original df + new columns (no duplicated extras)
     out = pd.DataFrame(results)
     out_for_join = out.drop(columns=["_row", "sku", "sku_name"], errors="ignore")
     audited = pd.concat([df, out_for_join], axis=1)
@@ -821,27 +811,21 @@ def main():
             )
 
     st.markdown("#### Summary KPIs")
-    total = len(audited)
-    must = int(audited["requires_nrv_final"].sum())
-    present = int(audited["has_nrv_value"].sum())
-    fail = int((audited["requires_nrv_final"] & ~audited["has_nrv_value"]).sum())
-
     kpis = {
-        "Rows audited": total,
-        "Require %NRV": must,
-        "NRV present (any vitamin/mineral)": present,
-        "Open findings (fail)": fail,
+        "Rows audited": len(df),
+        "Require %NRV (needs_nrv=True)": int(kpi_must),
+        "NRV present (JSON detected any %)": int(kpi_present),
+        "Open findings (needs_nrv=True but no % found)": int(kpi_fail),
         "AI calls used": ai_calls,
         "Estimated input tokens (pre-run)": int(est_input_tokens_total),
         "Estimated output tokens (pre-run)": int(est_output_tokens_total),
         "Projected cost (USD)": round(projected_cost, 6),
         "Actual input tokens": actual_in_tokens,
         "Actual output tokens": actual_out_tokens,
+        "Actual cost (USD)": (
+            round(actual_cost, 6) if actual_cost is not None else "n/a"
+        ),
     }
-    if actual_cost is not None:
-        kpis["Actual cost (USD)"] = round(actual_cost, 6)
-    else:
-        kpis["Actual cost (USD)"] = "n/a (usage not returned or model pricing unknown)"
     st.write(kpis)
 
     # Export
@@ -856,9 +840,9 @@ def main():
     )
 
     st.info(
-        "Auto-pricing uses built-in rates for the selected model; "
-        "projection estimates input tokens from the real prompt+records (~4 chars/token) and assumes ~60 output tokens/call. "
-        "Actual cost uses API usage if available. For .xlsx uploads, ensure 'openpyxl' is installed."
+        "The table adds only 'needs_nrv' and 'debug_checks'. "
+        "Auto-pricing uses built-in rates; projection estimates input tokens (~4 chars/token) "
+        "and assumes ~60 output tokens/call. Actual cost uses API usage if available."
     )
 
 
